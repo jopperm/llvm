@@ -30,8 +30,7 @@ using namespace llvm;
 
 namespace {
 
-class GetModuleAction : public ToolAction {
-public:
+struct GetModuleAction : public ToolAction {
   bool runInvocation(std::shared_ptr<CompilerInvocation> Invocation,
                      FileManager *Files,
                      std::shared_ptr<PCHContainerOperations> PCHContainerOps,
@@ -55,14 +54,22 @@ public:
     // emitting anything) instead.
     EmitLLVMOnlyAction ELOA;
     const bool Success = Compiler.ExecuteAction(ELOA);
-    if (auto M = ELOA.takeModule()) {
-      if (auto *F = M->getFunction("_ZTS11hello_world"))
-        F->dump();
-    }
-
     Files->clearStatCache();
-    return Success;
+    if (!Success)
+      return false;
+
+    // Take the module and its context to extend the objects' lifetime.
+    // Alternatively, we could also pass our own context to the action's
+    // constructor.
+    // Note that this PoC doesn't handle more than 1 source file.
+    Module = ELOA.takeModule();
+    Context = ELOA.takeLLVMContext();
+
+    return true;
   }
+
+  std::unique_ptr<llvm::Module> Module;
+  llvm::LLVMContext *Context;
 };
 
 } // namespace
@@ -87,35 +94,32 @@ int main(int argc, const char **argv) {
   // particular the `-fsyntax-only` inserter.
   Tool.clearArgumentsAdjusters();
 
-  const char *HelloWorldKernel = R"""(
+  const char *RTCKernel = R"""(
     #include <sycl/sycl.hpp>
     using namespace sycl;
 
-    class hello_world;
-
-    int main() {
-      auto defaultQueue = sycl::queue{};
-
-      defaultQueue
-        .submit([&](sycl::handler &cgh) {
-          auto os = sycl::stream{128, 128, cgh};
-
-          cgh.single_task<hello_world>([=]() { os << "Hello World!\n"; });
-        })
-        .wait();
-
-      return 0;
+    extern "C" SYCL_EXT_ONEAPI_FUNCTION_PROPERTY(
+      (ext::oneapi::experimental::single_task_kernel))
+    void ff_0(int *ptr, int start, int end) {
+      for (int i = start; i <= end; i++)
+        ptr[i] = start + end;
     }
     )""";
 
   // Conveniently register an in memory file. This is an overlay over the actual
   // file system, so existing headers etc. will be found.
-  Tool.mapVirtualFile("rtc.cpp", HelloWorldKernel);
+  Tool.mapVirtualFile("rtc.cpp", RTCKernel);
 
   // Execute the action. Down the line, a `clang::driver::Driver` will be
   // created in `ToolInvocation::run` because we didn't specify a `-cc1` command
   // line. The driver sets up the `CompilerInvocation` that is then passed to
   // our `GetModuleAction`.
   GetModuleAction Action;
-  return Tool.run(&Action);
+  if (!Tool.run(&Action)) {
+    Action.Module->dump();
+    Action.Module.reset();
+    delete Action.Context;
+  }
+
+  return 0;
 }
